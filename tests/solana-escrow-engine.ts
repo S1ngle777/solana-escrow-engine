@@ -73,7 +73,10 @@ describe("solana-escrow-engine", () => {
     console.log("  Vault PDA: ", vaultPda.toBase58());
   });
 
-  // ─── Test 1: Initialize ────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SECTION 1: Core lifecycle (happy path)
+  // ═══════════════════════════════════════════════════════════════════════════
+
   it("1. Initializes an escrow (buyer creates PDA accounts)", async () => {
     const tx = await program.methods
       .initializeEscrow(
@@ -103,9 +106,9 @@ describe("solana-escrow-engine", () => {
     assert.equal(escrow.amount.toString(), AMOUNT.toString());
     assert.equal(escrow.description, "Payment for freelance web development work");
     assert.deepEqual(escrow.state, { active: {} });
+    assert.isAbove(escrow.createdAt.toNumber(), 0, "created_at should be set");
   });
 
-  // ─── Test 2: Deposit ───────────────────────────────────────────────────────
   it("2. Deposits SOL into vault (buyer funds the escrow)", async () => {
     const vaultBefore = await provider.connection.getBalance(vaultPda);
     const buyerBefore = await provider.connection.getBalance(buyer.publicKey);
@@ -132,8 +135,11 @@ describe("solana-escrow-engine", () => {
     console.log(`  Vault balance: ${vaultAfter} lamports (+${AMOUNT} escrowed)`);
   });
 
-  // ─── Test 3: Unauthorized dispute ─────────────────────────────────────────
-  it("3. Rejects dispute from an outsider (access control check)", async () => {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SECTION 2: Access control tests
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  it("3. Rejects dispute from an outsider (access control)", async () => {
     try {
       await program.methods
         .dispute(ESCROW_ID)
@@ -150,8 +156,49 @@ describe("solana-escrow-engine", () => {
     }
   });
 
-  // ─── Test 4: Dispute ───────────────────────────────────────────────────────
-  it("4. Buyer opens a dispute (state transition: Funded → Disputed)", async () => {
+  it("4. Rejects release from an outsider (access control)", async () => {
+    try {
+      await program.methods
+        .release(ESCROW_ID)
+        .accounts({
+          caller: outsider.publicKey,
+          escrow: escrowPda,
+          vault: vaultPda,
+          seller: seller.publicKey,
+        })
+        .signers([outsider])
+        .rpc();
+      assert.fail("Should have thrown Unauthorized error");
+    } catch (err: any) {
+      assert.include(err.message, "Unauthorized");
+      console.log("  ✓ Outsider cannot release funds");
+    }
+  });
+
+  it("5. Rejects release with wrong seller address", async () => {
+    try {
+      await program.methods
+        .release(ESCROW_ID)
+        .accounts({
+          caller: buyer.publicKey,
+          escrow: escrowPda,
+          vault: vaultPda,
+          seller: outsider.publicKey, // wrong seller!
+        })
+        .signers([buyer])
+        .rpc();
+      assert.fail("Should have thrown InvalidSeller error");
+    } catch (err: any) {
+      assert.include(err.message, "InvalidSeller");
+      console.log("  ✓ Release with wrong seller correctly rejected");
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SECTION 3: Dispute resolution flow
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  it("6. Buyer opens a dispute (state: Funded → Disputed)", async () => {
     const tx = await program.methods
       .dispute(ESCROW_ID)
       .accounts({
@@ -167,8 +214,7 @@ describe("solana-escrow-engine", () => {
     assert.deepEqual(escrow.state, { disputed: {} });
   });
 
-  // ─── Test 5: Arbiter resolves — releases to seller ─────────────────────────
-  it("5. Arbiter releases funds to seller (dispute resolution)", async () => {
+  it("7. Arbiter releases funds to seller (dispute resolution)", async () => {
     const sellerBefore = await provider.connection.getBalance(seller.publicKey);
     const vaultBefore = await provider.connection.getBalance(vaultPda);
 
@@ -195,8 +241,197 @@ describe("solana-escrow-engine", () => {
     console.log(`  Seller received: ${sellerAfter - sellerBefore} lamports`);
   });
 
-  // ─── Test 6: Happy path refund ─────────────────────────────────────────────
-  it("6. Seller voluntarily refunds buyer (happy path refund)", async () => {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SECTION 4: State guard tests
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  it("8. Rejects release on already released escrow (double-release guard)", async () => {
+    try {
+      await program.methods
+        .release(ESCROW_ID)
+        .accounts({
+          caller: buyer.publicKey,
+          escrow: escrowPda,
+          vault: vaultPda,
+          seller: seller.publicKey,
+        })
+        .signers([buyer])
+        .rpc();
+      assert.fail("Should have thrown InvalidState error");
+    } catch (err: any) {
+      assert.include(err.message, "InvalidState");
+      console.log("  ✓ Double-release correctly rejected");
+    }
+  });
+
+  it("9. Rejects double-deposit on already funded escrow (state guard)", async () => {
+    const escrowId3 = new BN(3);
+    const { escrowPda: ep3, vaultPda: vp3 } = getPDAs(
+      program,
+      buyer.publicKey,
+      escrowId3
+    );
+
+    await program.methods
+      .initializeEscrow(
+        escrowId3,
+        seller.publicKey,
+        arbiter.publicKey,
+        AMOUNT,
+        "Double-deposit test"
+      )
+      .accounts({
+        buyer: buyer.publicKey,
+        escrow: ep3,
+        vault: vp3,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([buyer])
+      .rpc();
+
+    await program.methods
+      .deposit(escrowId3)
+      .accounts({
+        buyer: buyer.publicKey,
+        escrow: ep3,
+        vault: vp3,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([buyer])
+      .rpc();
+
+    try {
+      await program.methods
+        .deposit(escrowId3)
+        .accounts({
+          buyer: buyer.publicKey,
+          escrow: ep3,
+          vault: vp3,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([buyer])
+        .rpc();
+      assert.fail("Should have thrown InvalidState");
+    } catch (err: any) {
+      assert.include(err.message, "InvalidState");
+      console.log("  ✓ Double-deposit correctly rejected with InvalidState");
+    }
+  });
+
+  it("10. Rejects dispute on Active escrow (not yet funded)", async () => {
+    const escrowId5 = new BN(5);
+    const { escrowPda: ep5, vaultPda: vp5 } = getPDAs(
+      program,
+      buyer.publicKey,
+      escrowId5
+    );
+
+    await program.methods
+      .initializeEscrow(
+        escrowId5,
+        seller.publicKey,
+        arbiter.publicKey,
+        AMOUNT,
+        "Dispute-before-fund test"
+      )
+      .accounts({
+        buyer: buyer.publicKey,
+        escrow: ep5,
+        vault: vp5,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([buyer])
+      .rpc();
+
+    try {
+      await program.methods
+        .dispute(escrowId5)
+        .accounts({
+          caller: buyer.publicKey,
+          escrow: ep5,
+        })
+        .signers([buyer])
+        .rpc();
+      assert.fail("Should have thrown InvalidState — can't dispute unfunded escrow");
+    } catch (err: any) {
+      assert.include(err.message, "InvalidState");
+      console.log("  ✓ Dispute on unfunded escrow correctly rejected");
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SECTION 5: Input validation tests
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  it("11. Rejects zero-amount escrow (input validation)", async () => {
+    const escrowId6 = new BN(6);
+    const { escrowPda: ep6, vaultPda: vp6 } = getPDAs(
+      program,
+      buyer.publicKey,
+      escrowId6
+    );
+
+    try {
+      await program.methods
+        .initializeEscrow(
+          escrowId6,
+          seller.publicKey,
+          arbiter.publicKey,
+          new BN(0), // zero amount
+          "Zero amount test"
+        )
+        .accounts({
+          buyer: buyer.publicKey,
+          escrow: ep6,
+          vault: vp6,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([buyer])
+        .rpc();
+      assert.fail("Should have thrown InvalidAmount");
+    } catch (err: any) {
+      assert.include(err.message, "InvalidAmount");
+      console.log("  ✓ Zero-amount escrow correctly rejected");
+    }
+  });
+
+  it("12. Rejects escrow where buyer == seller", async () => {
+    const escrowId7 = new BN(7);
+    const { escrowPda: ep7, vaultPda: vp7 } = getPDAs(
+      program,
+      buyer.publicKey,
+      escrowId7
+    );
+
+    try {
+      await program.methods
+        .initializeEscrow(
+          escrowId7,
+          buyer.publicKey, // buyer == seller!
+          arbiter.publicKey,
+          AMOUNT,
+          "Self-escrow test"
+        )
+        .accounts({
+          buyer: buyer.publicKey,
+          escrow: ep7,
+          vault: vp7,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([buyer])
+        .rpc();
+      assert.fail("Should have thrown BuyerCannotBeSeller");
+    } catch (err: any) {
+      assert.include(err.message, "BuyerCannotBeSeller");
+      console.log("  ✓ Self-escrow correctly rejected");
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SECTION 6: Happy path flows
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  it("13. Seller voluntarily refunds buyer (happy path refund)", async () => {
     const escrowId2 = new BN(2);
     const { escrowPda: ep2, vaultPda: vp2 } = getPDAs(
       program,
@@ -256,63 +491,7 @@ describe("solana-escrow-engine", () => {
     console.log(`  Buyer refunded: ${buyerAfter - buyerBefore} lamports`);
   });
 
-  // ─── Test 7: Double-deposit rejected ──────────────────────────────────────
-  it("7. Rejects double-deposit on already funded escrow (state guard)", async () => {
-    const escrowId3 = new BN(3);
-    const { escrowPda: ep3, vaultPda: vp3 } = getPDAs(
-      program,
-      buyer.publicKey,
-      escrowId3
-    );
-
-    await program.methods
-      .initializeEscrow(
-        escrowId3,
-        seller.publicKey,
-        arbiter.publicKey,
-        AMOUNT,
-        "Double-deposit test"
-      )
-      .accounts({
-        buyer: buyer.publicKey,
-        escrow: ep3,
-        vault: vp3,
-        systemProgram: SystemProgram.programId,
-      })
-      .signers([buyer])
-      .rpc();
-
-    await program.methods
-      .deposit(escrowId3)
-      .accounts({
-        buyer: buyer.publicKey,
-        escrow: ep3,
-        vault: vp3,
-        systemProgram: SystemProgram.programId,
-      })
-      .signers([buyer])
-      .rpc();
-
-    try {
-      await program.methods
-        .deposit(escrowId3)
-        .accounts({
-          buyer: buyer.publicKey,
-          escrow: ep3,
-          vault: vp3,
-          systemProgram: SystemProgram.programId,
-        })
-        .signers([buyer])
-        .rpc();
-      assert.fail("Should have thrown InvalidState");
-    } catch (err: any) {
-      assert.include(err.message, "InvalidState");
-      console.log("  ✓ Double-deposit correctly rejected with InvalidState");
-    }
-  });
-
-  // ─── Test 8: Buyer releases directly ──────────────────────────────────────
-  it("8. Buyer releases funds directly to seller (happy path)", async () => {
+  it("14. Buyer releases funds directly to seller (happy path)", async () => {
     const escrowId4 = new BN(4);
     const { escrowPda: ep4, vaultPda: vp4 } = getPDAs(
       program,
@@ -369,6 +548,111 @@ describe("solana-escrow-engine", () => {
     assert.equal(sellerAfter - sellerBefore, AMOUNT.toNumber());
     assert.deepEqual(escrowState.state, { released: {} });
     console.log(`  Seller received: ${sellerAfter - sellerBefore} lamports`);
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SECTION 7: Rent reclamation (close_escrow)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  it("15. Closes released escrow and reclaims rent to buyer", async () => {
+    // Use escrow #4 which was released in test 14
+    const escrowId4 = new BN(4);
+    const { escrowPda: ep4, vaultPda: vp4 } = getPDAs(
+      program,
+      buyer.publicKey,
+      escrowId4
+    );
+
+    const buyerBefore = await provider.connection.getBalance(buyer.publicKey);
+    const escrowRent = await provider.connection.getBalance(ep4);
+    const vaultRent = await provider.connection.getBalance(vp4);
+
+    console.log(`  Escrow rent: ${escrowRent} lamports`);
+    console.log(`  Vault rent:  ${vaultRent} lamports`);
+
+    const tx = await program.methods
+      .closeEscrow(escrowId4)
+      .accounts({
+        buyer: buyer.publicKey,
+        escrow: ep4,
+        vault: vp4,
+      })
+      .signers([buyer])
+      .rpc();
+
+    console.log("  ✓ closeEscrow tx:", tx);
+
+    const buyerAfter = await provider.connection.getBalance(buyer.publicKey);
+
+    // Buyer should have received rent back (minus small tx fee)
+    const rentReclaimed = buyerAfter - buyerBefore;
+    assert.isAbove(rentReclaimed, 0, "Buyer should receive rent back");
+    console.log(`  Rent reclaimed: ${rentReclaimed} lamports`);
+
+    // Accounts should no longer exist
+    const escrowInfo = await provider.connection.getAccountInfo(ep4);
+    const vaultInfo = await provider.connection.getAccountInfo(vp4);
+    assert.isNull(escrowInfo, "Escrow account should be closed");
+    assert.isNull(vaultInfo, "Vault account should be closed");
+    console.log("  ✓ Both PDA accounts closed, storage freed");
+  });
+
+  it("16. Closes refunded escrow and reclaims rent to buyer", async () => {
+    // Use escrow #2 which was refunded in test 13
+    const escrowId2 = new BN(2);
+    const { escrowPda: ep2, vaultPda: vp2 } = getPDAs(
+      program,
+      buyer.publicKey,
+      escrowId2
+    );
+
+    const buyerBefore = await provider.connection.getBalance(buyer.publicKey);
+
+    const tx = await program.methods
+      .closeEscrow(escrowId2)
+      .accounts({
+        buyer: buyer.publicKey,
+        escrow: ep2,
+        vault: vp2,
+      })
+      .signers([buyer])
+      .rpc();
+
+    console.log("  ✓ closeEscrow (refunded) tx:", tx);
+
+    const buyerAfter = await provider.connection.getBalance(buyer.publicKey);
+    assert.isAbove(buyerAfter - buyerBefore, 0, "Buyer should receive rent back");
+
+    // Accounts should be gone
+    const escrowInfo = await provider.connection.getAccountInfo(ep2);
+    assert.isNull(escrowInfo, "Escrow account should be closed");
+    console.log("  ✓ Refunded escrow cleaned up");
+  });
+
+  it("17. Rejects close_escrow on funded (unsettled) escrow", async () => {
+    // Escrow #3 is funded but not released/refunded
+    const escrowId3 = new BN(3);
+    const { escrowPda: ep3, vaultPda: vp3 } = getPDAs(
+      program,
+      buyer.publicKey,
+      escrowId3
+    );
+
+    try {
+      await program.methods
+        .closeEscrow(escrowId3)
+        .accounts({
+          buyer: buyer.publicKey,
+          escrow: ep3,
+          vault: vp3,
+        })
+        .signers([buyer])
+        .rpc();
+      assert.fail("Should have thrown EscrowNotSettled");
+    } catch (err: any) {
+      assert.include(err.message, "EscrowNotSettled");
+      console.log("  ✓ Cannot close unsettled escrow — funds protected");
+    }
   });
 });
 

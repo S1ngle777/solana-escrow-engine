@@ -228,6 +228,38 @@ async function cmdDispute(args: string[]) {
   console.log(`\n✅ Disputed! Transaction: https://explorer.solana.com/tx/${tx}?cluster=${CLUSTER}`);
 }
 
+async function cmdClose(args: string[]) {
+  const escrowId = new BN(requireArg(args, "--id"));
+  const keypairPath = getArg(args, "--keypair") || "";
+  const payer = loadKeypair(keypairPath);
+
+  const { escrowPda, vaultPda } = getPDAs(payer.publicKey, escrowId);
+  const connection = new Connection(RPC_URL, "confirmed");
+  const provider = buildProvider(payer);
+  const program = new Program(IDL, provider);
+
+  const escrowRent = await connection.getBalance(escrowPda);
+  const vaultRent = await connection.getBalance(vaultPda);
+  const totalRent = escrowRent + vaultRent;
+
+  console.log(`\nClosing escrow #${escrowId} and reclaiming rent...`);
+  console.log(`  Escrow rent: ${escrowRent} lamports`);
+  console.log(`  Vault rent:  ${vaultRent} lamports`);
+  console.log(`  Total:       ${totalRent} lamports (${totalRent / LAMPORTS_PER_SOL} SOL)`);
+
+  const tx = await (program.methods as any)
+    .closeEscrow(escrowId)
+    .accounts({
+      buyer: payer.publicKey,
+      escrow: escrowPda,
+      vault: vaultPda,
+    })
+    .signers([payer])
+    .rpc();
+
+  console.log(`\n✅ Closed! Rent reclaimed. Transaction: https://explorer.solana.com/tx/${tx}?cluster=${CLUSTER}`);
+}
+
 async function cmdStatus(args: string[]) {
   const escrowId = new BN(requireArg(args, "--id"));
   const buyerPk = new PublicKey(requireArg(args, "--buyer"));
@@ -295,6 +327,7 @@ const COMMANDS: Record<string, (args: string[]) => Promise<void>> = {
   release: cmdRelease,
   refund: cmdRefund,
   dispute: cmdDispute,
+  close: cmdClose,
   status: cmdStatus,
 };
 
@@ -310,6 +343,7 @@ Commands:
   release   --id <n> --buyer <pk> --seller <pk> [--keypair <path>]
   refund    --id <n> --buyer <pk> [--keypair <path>]
   dispute   --id <n> --buyer <pk> [--keypair <path>]
+  close     --id <n> [--keypair <path>]             (reclaim rent from settled escrow)
   status    --id <n> --buyer <pk> [--keypair <path>]
 
 Environment:
@@ -327,6 +361,9 @@ Examples:
 
   # Check status
   CLUSTER=devnet npx ts-node client/cli.ts status --id 42 --buyer <BUYER_PUBKEY>
+
+  # Close a settled escrow (reclaim rent)
+  CLUSTER=devnet npx ts-node client/cli.ts close --id 42
 `);
   process.exit(0);
 }

@@ -1,6 +1,13 @@
 /**
- * Devnet demo: creates a real escrow, funds it, and releases it.
- * Run: CLUSTER=devnet npx ts-node client/devnet_demo.ts
+ * Devnet Demo — Full Escrow Lifecycle
+ *
+ * Demonstrates all 6 instructions on Solana Devnet:
+ *   1. initializeEscrow — create escrow + vault PDAs
+ *   2. deposit          — fund the vault with SOL
+ *   3. release          — buyer releases funds to seller
+ *   4. closeEscrow      — reclaim rent from settled escrow
+ *
+ * Run: npx ts-node client/devnet_demo.ts
  */
 import * as anchor from "@coral-xyz/anchor";
 import { BN, Program, AnchorProvider, Wallet } from "@coral-xyz/anchor";
@@ -46,9 +53,12 @@ function getPDAs(buyer: PublicKey, escrowId: BN) {
   return { escrowPda, vaultPda };
 }
 
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 async function main() {
   const payer = loadKeypair();
-  // Use different keypairs generated locally (no airdrop needed — payer covers everything)
   const seller = Keypair.generate();
   const arbiter = Keypair.generate();
 
@@ -63,20 +73,25 @@ async function main() {
   const { escrowPda, vaultPda } = getPDAs(payer.publicKey, ESCROW_ID);
 
   const bal = await connection.getBalance(payer.publicKey);
-  console.log(`\nWallet: ${payer.publicKey.toBase58()}`);
-  console.log(`Balance: ${bal / LAMPORTS_PER_SOL} SOL`);
-  console.log(`Escrow ID: ${ESCROW_ID.toString()}`);
-  console.log(`Amount: ${AMOUNT.toNumber() / LAMPORTS_PER_SOL} SOL`);
+  console.log(`\n╔═══════════════════════════════════════════════════╗`);
+  console.log(`║         SOLANA ESCROW ENGINE — DEVNET DEMO        ║`);
+  console.log(`╚═══════════════════════════════════════════════════╝`);
+  console.log(`\n  Wallet:    ${payer.publicKey.toBase58()}`);
+  console.log(`  Balance:   ${bal / LAMPORTS_PER_SOL} SOL`);
+  console.log(`  Escrow ID: ${ESCROW_ID.toString()}`);
+  console.log(`  Amount:    ${AMOUNT.toNumber() / LAMPORTS_PER_SOL} SOL`);
+  console.log(`  Seller:    ${seller.publicKey.toBase58()}`);
+  console.log(`  Arbiter:   ${arbiter.publicKey.toBase58()}`);
 
   // ── 1. Initialize ──────────────────────────────────────────────────────────
-  console.log("\n[1/3] Calling initializeEscrow...");
+  console.log("\n[1/4] initializeEscrow — creating EscrowAccount + VaultAccount PDAs...");
   const tx1 = await (program.methods as any)
     .initializeEscrow(
       ESCROW_ID,
       seller.publicKey,
       arbiter.publicKey,
       AMOUNT,
-      "Devnet demo: payment for bounty submission"
+      "Devnet demo: full escrow lifecycle with rent reclamation"
     )
     .accounts({
       buyer: payer.publicKey,
@@ -86,10 +101,12 @@ async function main() {
     })
     .signers([payer])
     .rpc();
-  console.log(`✅ initializeEscrow: https://explorer.solana.com/tx/${tx1}?cluster=devnet`);
+  console.log(`  ✅ TX: https://explorer.solana.com/tx/${tx1}?cluster=devnet`);
+
+  await sleep(1500);
 
   // ── 2. Deposit ─────────────────────────────────────────────────────────────
-  console.log("\n[2/3] Calling deposit...");
+  console.log("\n[2/4] deposit — locking SOL in vault PDA...");
   const tx2 = await (program.methods as any)
     .deposit(ESCROW_ID)
     .accounts({
@@ -100,10 +117,12 @@ async function main() {
     })
     .signers([payer])
     .rpc();
-  console.log(`✅ deposit: https://explorer.solana.com/tx/${tx2}?cluster=devnet`);
+  console.log(`  ✅ TX: https://explorer.solana.com/tx/${tx2}?cluster=devnet`);
+
+  await sleep(1500);
 
   // ── 3. Release ─────────────────────────────────────────────────────────────
-  console.log("\n[3/3] Calling release (buyer approves)...");
+  console.log("\n[3/4] release — buyer approves, SOL transfers to seller...");
   const tx3 = await (program.methods as any)
     .release(ESCROW_ID)
     .accounts({
@@ -114,19 +133,47 @@ async function main() {
     })
     .signers([payer])
     .rpc();
-  console.log(`✅ release: https://explorer.solana.com/tx/${tx3}?cluster=devnet`);
+  console.log(`  ✅ TX: https://explorer.solana.com/tx/${tx3}?cluster=devnet`);
 
-  // ── Read final state ───────────────────────────────────────────────────────
-  const escrow = await (program.account as any).escrowAccount.fetch(escrowPda);
-  console.log("\n📋 Final escrow state:", JSON.stringify(escrow.state));
-  console.log("\n═══════════════════════════════════════════════════");
-  console.log("DEVNET TRANSACTION LINKS:");
-  console.log(`Deploy:   https://explorer.solana.com/tx/RCjdWhimdFD78YP4pSSC98bLp28u4csDQ41JiEjFowM9EWjYHknLGK1AU7Msi1JdsnowGXtH1Hhj7mPGcvn7zXR?cluster=devnet`);
-  console.log(`Init:     https://explorer.solana.com/tx/${tx1}?cluster=devnet`);
-  console.log(`Deposit:  https://explorer.solana.com/tx/${tx2}?cluster=devnet`);
-  console.log(`Release:  https://explorer.solana.com/tx/${tx3}?cluster=devnet`);
-  console.log(`Program:  https://explorer.solana.com/address/${PROGRAM_ID.toBase58()}?cluster=devnet`);
-  console.log("═══════════════════════════════════════════════════");
+  await sleep(1500);
+
+  // ── 4. Close (rent reclamation) ────────────────────────────────────────────
+  const rentBefore = await connection.getBalance(payer.publicKey);
+  console.log("\n[4/4] closeEscrow — reclaiming rent from settled escrow...");
+  const tx4 = await (program.methods as any)
+    .closeEscrow(ESCROW_ID)
+    .accounts({
+      buyer: payer.publicKey,
+      escrow: escrowPda,
+      vault: vaultPda,
+    })
+    .signers([payer])
+    .rpc();
+  const rentAfter = await connection.getBalance(payer.publicKey);
+  console.log(`  ✅ TX: https://explorer.solana.com/tx/${tx4}?cluster=devnet`);
+  console.log(`  💰 Rent reclaimed: ${(rentAfter - rentBefore) / LAMPORTS_PER_SOL} SOL`);
+
+  // ── Summary ────────────────────────────────────────────────────────────────
+  console.log(`\n╔═══════════════════════════════════════════════════╗`);
+  console.log(`║                DEVNET TRANSACTION LOG             ║`);
+  console.log(`╠═══════════════════════════════════════════════════╣`);
+  console.log(`║ Program: ${PROGRAM_ID.toBase58()}           ║`);
+  console.log(`╠═══════════════════════════════════════════════════╣`);
+  console.log(`║ initializeEscrow:                                ║`);
+  console.log(`║   ${tx1}`);
+  console.log(`║ deposit:                                         ║`);
+  console.log(`║   ${tx2}`);
+  console.log(`║ release:                                         ║`);
+  console.log(`║   ${tx3}`);
+  console.log(`║ closeEscrow:                                     ║`);
+  console.log(`║   ${tx4}`);
+  console.log(`╚═══════════════════════════════════════════════════╝`);
+  console.log(`\nExplorer links:`);
+  console.log(`  Program:  https://explorer.solana.com/address/${PROGRAM_ID.toBase58()}?cluster=devnet`);
+  console.log(`  Init:     https://explorer.solana.com/tx/${tx1}?cluster=devnet`);
+  console.log(`  Deposit:  https://explorer.solana.com/tx/${tx2}?cluster=devnet`);
+  console.log(`  Release:  https://explorer.solana.com/tx/${tx3}?cluster=devnet`);
+  console.log(`  Close:    https://explorer.solana.com/tx/${tx4}?cluster=devnet`);
 }
 
 main().catch(console.error);
