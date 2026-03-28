@@ -113,7 +113,7 @@ All of these share the same core backend pattern: a **state machine** managing f
 │                                                                         │
 │  Client (CLI/dApp) ──sign tx──▶ Escrow Program (Rust/Anchor)           │
 │                                         │                               │
-│  Auth: Ed25519 Signature       ┌────────┴────────┐                      │
+│  Auth: Ed25519 Signature       ┌────────┴─────────┐                     │
 │  ────────────────────          │                  │                     │
 │  Private key signs tx.         ▼                  ▼                     │
 │  Runtime verifies before   EscrowAccount PDA   VaultAccount PDA         │
